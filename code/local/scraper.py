@@ -1,3 +1,4 @@
+from pathlib import Path
 import re
 import requests
 import wget
@@ -27,13 +28,14 @@ def scrape_fma(output_path, genres, page_nums, song_per_page_limit, overwrite_fi
         # Set up folders for each genre
         output_folder_path = output_path + genre + '/'
 
-        # Delete existing directory if required
-        if overwrite_files == True:
-            if os.path.exists(output_folder_path):
-                shutil.rmtree(output_folder_path)
-            os.mkdir(output_folder_path)
+        # Create or recreate directory for the genre
+        output_folder = Path(output_folder_path)
+        if overwrite_files:
+            if output_folder.exists():
+                shutil.rmtree(output_folder)
+            output_folder.mkdir(parents=True, exist_ok=True)
         else:
-            os.mkdir(output_folder_path)
+            output_folder.mkdir(parents=True, exist_ok=True)
 
         clean_urls = []
         song_id = 0
@@ -42,24 +44,50 @@ def scrape_fma(output_path, genres, page_nums, song_per_page_limit, overwrite_fi
         for i in page_nums:
 
             # Grab the HTML webpage and find all the links to each song
-            page = requests.get(f"https://freemusicarchive.org/genre/{genre}?sort=track_date_published&d=1&page={i}")
+            page = requests.get(f"https://freemusicarchive.org/genre/{genre}/?page={i}")
             soup = BeautifulSoup(page.content, 'html.parser')
-            playlist_space = soup.find(class_="playlist playlist-lrg")
-            song_space = playlist_space.find_all(class_="icn-arrow")
+            playlist_space = soup.find(class_="w-full flex flex-col gap-3 pt-3")
+            song_space = playlist_space.find_all(class_="ptxt-track")
 
-            # Build a messy list of all the song URLS on the page
-            list_of_urls = re.findall("(?<=href=)(.*?)( )", str(song_space))
+            # Collect all href attributes inside the song_space (any instance of href)
+            list_of_urls = []
+            for tag in song_space:
+                for a in tag.find_all(href=True):
+                    href = a.get('href')
+                    if href:
+                        list_of_urls.append(href)
 
             # Go through and clean each URL before scraping the song (Takes a while)
-            for x in list_of_urls[0:song_per_page_limit]:
-                clean_url_link = x[0][1:-1]
-                clean_urls.append(clean_url_link) 
+            for clean_url_link in list_of_urls[0:song_per_page_limit]:
+                clean_urls.append(clean_url_link)
 
                 song_name = clean_url_link.split("/")[-1]
-                song_file = requests.get(clean_url_link)
+                song_page = requests.get(clean_url_link)
 
-                with open(output_path + genre + '/' + 'Song' + str(song_id) + '_' + song_name, 'wb') as f:
-                    f.write(song_file.content)
+                soup = BeautifulSoup(song_page.content, 'html.parser')
+                song_data = soup.find(attrs={"data-track-info": True}).get('data-track-info')
+                json_song_data = json.loads(song_data)
+                file_url = json_song_data['fileUrl']
+
+                try:
+                    with requests.get(file_url, stream=True, timeout=30) as song_file:
+                        song_file.raise_for_status()
+
+                        downloaded_kb = 0
+                        out_path = Path(output_path) / genre / f"Song{song_id}.mp3"
+                        with open(out_path, 'wb') as f:
+                            for chunk in song_file.iter_content(chunk_size=8192):
+                                if not chunk:
+                                    continue
+                                f.write(chunk)
+                                downloaded_kb += len(chunk) // 1024
+                                print(f"Downloaded {downloaded_kb} KB of song {song_id}", end='\r', flush=True)
+                        print(' ' * 80, end='\r')
+                    print(f"Completed download of song {song_id}")
+                except requests.exceptions.RequestException as e:
+                    print(f"Error downloading {file_url}: {e}")
+                    # skip this song and continue
+                    continue
 
                 # Iterate song ids
                 song_id +=  1
@@ -73,7 +101,10 @@ def scrape_fma(output_path, genres, page_nums, song_per_page_limit, overwrite_fi
 
     # Write out the file dictionary as a JSON
     song_id_json = json.dumps(song_ref_dict)
-    f = open("../../songs/song_id_dict.json","w")
-    f.write(song_id_json)
-    f.close()
+
+    base_output = (Path(__file__).resolve().parent / '..' / 'songs').resolve()
+    base_output.mkdir(parents=True, exist_ok=True)
+
+    json_path = base_output / 'song_id_dict.json'
+    json_path.write_text(song_id_json)
     
